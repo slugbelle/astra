@@ -8,7 +8,10 @@ import pandas as pd
 from datetime import datetime, timedelta, date, time
 import json
 import os
+import math
 import pytz
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from timezonefinder import TimezoneFinder
 from geopy.geocoders import Nominatim
 import kp_calc as kp
@@ -56,6 +59,190 @@ PLANET_COLOR_MAP = {
     'Saturn': '#AAAAAA', 'Rahu': '#9966FF', 'Ketu': '#CC4444',
     'Uranus': '#00CCCC', 'Neptune': '#4488FF', 'Pluto': '#996633'
 }
+
+SIGN_SYMBOLS = ['♈','♉','♊','♋','♌','♍','♎','♏','♐','♑','♒','♓']
+ELEMENT_COLORS = {
+    'fire': '#FF6B6B', 'earth': '#8BC34A', 'air': '#FFD54F', 'water': '#64B5F6'
+}
+SIGN_ELEMENTS = [
+    'fire','earth','air','water','fire','earth',
+    'air','water','fire','earth','air','water'
+]
+
+# ========================
+# CHART WHEEL
+# ========================
+
+def _lon_to_angle(lon, asc_lon):
+    """Ecliptic longitude → matplotlib angle (degrees CCW from 3 o'clock). ASC = 180°."""
+    return (180.0 + (lon - asc_lon)) % 360.0
+
+def _polar_xy(angle_deg, r):
+    a = math.radians(angle_deg)
+    return r * math.cos(a), r * math.sin(a)
+
+def draw_natal_wheel(chart, title=""):
+    asc_lon = chart['house_cusps'][0]['longitude']
+    planets = chart['planet_positions']
+    cusps   = chart['house_cusps']
+
+    BG = '#0E1117'
+    R_OUT   = 1.00
+    R_SIGN  = 0.85
+    R_NAK   = 0.73
+    R_HOUSE = 0.62
+    R_PLANB = 0.50
+    R_IN    = 0.28
+
+    fig, ax = plt.subplots(figsize=(9, 9))
+    fig.patch.set_facecolor(BG)
+    ax.set_facecolor(BG)
+    ax.set_aspect('equal')
+    ax.axis('off')
+    ax.set_xlim(-1.25, 1.25)
+    ax.set_ylim(-1.25, 1.25)
+
+    # Zodiac ring: 12 coloured segments
+    for i, (sym, elem) in enumerate(zip(SIGN_SYMBOLS, SIGN_ELEMENTS)):
+        base_lon = i * 30.0
+        th1 = _lon_to_angle(base_lon, asc_lon)
+        wedge = mpatches.Wedge(
+            (0, 0), R_OUT, th1, th1 + 30,
+            width=R_OUT - R_SIGN,
+            facecolor=ELEMENT_COLORS[elem], alpha=0.22,
+            edgecolor='#333344', linewidth=0.6
+        )
+        ax.add_patch(wedge)
+        mx, my = _polar_xy(th1 + 15, (R_OUT + R_SIGN) / 2)
+        ax.text(mx, my, sym, ha='center', va='center',
+                fontsize=13, color=ELEMENT_COLORS[elem], fontweight='bold')
+        x1, y1 = _polar_xy(th1, R_SIGN)
+        x2, y2 = _polar_xy(th1, R_OUT)
+        ax.plot([x1, x2], [y1, y2], color='#444455', linewidth=0.8)
+
+    # Nakshatra ring: 27 thin segments
+    nak_size = 360 / 27
+    for i in range(27):
+        base_lon = i * nak_size
+        th1 = _lon_to_angle(base_lon, asc_lon)
+        x1, y1 = _polar_xy(th1, R_NAK)
+        x2, y2 = _polar_xy(th1, R_SIGN)
+        ax.plot([x1, x2], [y1, y2], color='#383848', linewidth=0.5)
+        if i % 2 == 0:
+            mid_angle = th1 + nak_size / 2
+            mx, my = _polar_xy(mid_angle, (R_SIGN + R_NAK) / 2)
+            rot = mid_angle % 360
+            if 90 < rot < 270:
+                rot -= 180
+            ax.text(mx, my, kp.NAKSHATRA_NAMES[i][:3], ha='center', va='center',
+                    fontsize=4.5, color='#666677', rotation=rot - 90)
+
+    # House cusp lines
+    for i, cusp in enumerate(cusps):
+        th = _lon_to_angle(cusp['longitude'], asc_lon)
+        x1, y1 = _polar_xy(th, R_HOUSE)
+        x2, y2 = _polar_xy(th, R_IN)
+        lw    = 1.8 if i in (0, 3, 6, 9) else 0.9
+        color = '#FFD700' if i in (0, 6) else ('#AAAAAA' if i in (3, 9) else '#445566')
+        ax.plot([x1, x2], [y1, y2], color=color, linewidth=lw, zorder=3)
+        x3, y3 = _polar_xy(th, R_NAK)
+        ax.plot([x1, x3], [y1, y3], color=color, linewidth=lw * 0.6, zorder=3)
+        # House number
+        next_lon = cusps[(i + 1) % 12]['longitude']
+        arc = (_lon_to_angle(next_lon, asc_lon) - th) % 360
+        mx, my = _polar_xy(th + arc / 2, (R_HOUSE + R_IN) / 2)
+        ax.text(mx, my, str(i + 1), ha='center', va='center',
+                fontsize=8, color='#778899', alpha=0.9, zorder=4)
+
+    # Concentric circles
+    for r, c, lw in [(R_OUT, '#445566', 1.2), (R_SIGN, '#333344', 0.8),
+                     (R_NAK, '#2a2a3a', 0.5), (R_HOUSE, '#445566', 1.0),
+                     (R_IN,  '#445566', 1.0)]:
+        ax.add_patch(plt.Circle((0, 0), r, fill=False, color=c, linewidth=lw))
+
+    # Planets — resolve radial overlaps
+    used = []
+    planet_display = []
+    for p in kp.PLANET_LIST:
+        if p not in planets:
+            continue
+        ang = _lon_to_angle(planets[p]['longitude'], asc_lon)
+        r = R_PLANB
+        for ua, ur in used:
+            diff = min(abs(ang - ua), 360 - abs(ang - ua))
+            if diff < 9:
+                r = ur - 0.11 if ur >= R_PLANB else ur + 0.11
+                break
+        used.append((ang, r))
+        planet_display.append((p, ang, r))
+
+    for p, ang, r in planet_display:
+        color = PLANET_COLOR_MAP.get(p, '#FFFFFF')
+        sym   = kp.PLANET_SYMBOLS.get(p, p[:2])
+        retro = '℞' if planets[p].get('retrograde') else ''
+        px, py = _polar_xy(ang, r)
+        ax.add_patch(plt.Circle((px, py), 0.055, color=color, alpha=0.18, zorder=5))
+        ax.text(px, py + 0.025, sym,
+                ha='center', va='center', fontsize=11, color=color, fontweight='bold', zorder=6)
+        ax.text(px, py - 0.028, f"{p[:3]}{retro}",
+                ha='center', va='center', fontsize=5.5, color=color, alpha=0.9, zorder=6)
+        x2, y2 = _polar_xy(ang, R_HOUSE)
+        ax.plot([px, x2], [py, y2], color=color, linewidth=0.4, linestyle=':', alpha=0.5, zorder=4)
+
+    # Cardinal point labels
+    for label, angle, color in [
+        ('ASC', 180, '#FFD700'), ('DSC', 0, '#FFD700'),
+        ('MC',   90, '#AAAAAA'), ('IC', 270, '#AAAAAA')
+    ]:
+        lx, ly = _polar_xy(angle, 1.14)
+        ax.text(lx, ly, label, ha='center', va='center',
+                fontsize=8, color=color, fontweight='bold')
+
+    # Centre info
+    asc  = cusps[0]
+    moon = planets.get('Moon', {})
+    ax.text(0,  0.07, f"☽ {moon.get('sign','')[:3]} · {moon.get('nakshatra','')[:6]}",
+            ha='center', va='center', fontsize=7, color='#C0C0C0')
+    ax.text(0,  0.00, f"⬆ {asc['sign'][:3]} {asc['degree_in_sign']:.1f}°",
+            ha='center', va='center', fontsize=8, color='#FFD700', fontweight='bold')
+    ax.text(0, -0.07, f"{chart.get('ayanamsa_type','KP')} Ayanamsa",
+            ha='center', va='center', fontsize=6, color='#555566')
+    if title:
+        ax.set_title(title, color='#CCCCCC', fontsize=11, pad=8)
+
+    plt.tight_layout(pad=0.2)
+    return fig
+
+
+def tab_wheel(chart, title=""):
+    st.subheader("🔮 Chart Wheel")
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        fig = draw_natal_wheel(chart, title)
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+    with col2:
+        st.markdown("**Element key**")
+        for elem, color in ELEMENT_COLORS.items():
+            st.markdown(
+                f'<span style="background:{color};color:#111;padding:2px 10px;'
+                f'border-radius:6px;font-size:0.8em;">{elem.title()}</span>',
+                unsafe_allow_html=True
+            )
+        st.markdown("---")
+        st.markdown("**Planets**")
+        for p in kp.PLANET_LIST:
+            if p in chart['planet_positions']:
+                d = chart['planet_positions'][p]
+                color = PLANET_COLOR_MAP.get(p, '#fff')
+                sym   = kp.PLANET_SYMBOLS.get(p, '')
+                retro = ' ℞' if d.get('retrograde') else ''
+                house = chart['planet_houses'].get(p, '')
+                st.markdown(
+                    f'<span style="color:{color}"><b>{sym} {p}{retro}</b></span> '
+                    f'<small style="color:#888">{d["sign"][:3]} {d["degree_in_sign"]:.1f}° H{house}</small>',
+                    unsafe_allow_html=True
+                )
 
 # ========================
 # HELPERS
@@ -699,22 +886,24 @@ def main():
     name = chart.get('name', 'Chart')
     st.title(f"🔭 {name}")
 
-    tabs = st.tabs(["📊 Overview", "🪐 Planets", "🏠 Houses", "🎯 Significators",
-                    "⏳ Dasha", "📐 Divisionals", "🌍 Transits"])
+    tabs = st.tabs(["🔮 Chart Wheel", "📊 Overview", "🪐 Planets", "🏠 Houses",
+                    "🎯 Significators", "⏳ Dasha", "📐 Divisionals", "🌍 Transits"])
 
     with tabs[0]:
-        tab_overview(chart)
+        tab_wheel(chart, title=name)
     with tabs[1]:
-        tab_planets(chart)
+        tab_overview(chart)
     with tabs[2]:
-        tab_houses(chart)
+        tab_planets(chart)
     with tabs[3]:
-        tab_significators(chart)
+        tab_houses(chart)
     with tabs[4]:
-        tab_dasha(chart)
+        tab_significators(chart)
     with tabs[5]:
-        tab_divisionals(chart)
+        tab_dasha(chart)
     with tabs[6]:
+        tab_divisionals(chart)
+    with tabs[7]:
         tab_transits(chart)
 
 
